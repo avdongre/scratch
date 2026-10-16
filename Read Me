@@ -21,3 +21,24 @@ Copy the output as text or export structured test fixtures for your parser, dash
 
 
 https://github.com/LimberDuck/nessus-file-analyzer
+
+
+
+
+3. Avoid making Docker Compose itself your service registry
+I'd use three separate layers:
+Web UI / CLI
+Add repo · Build · Start · Stop · Logs · Replay
+
+Development orchestrator
+Registry · Dependency graph · Build jobs · State · Events
+
+Docker Engine
+Containers · Images · Networks · Volumes · Health
+
+
+Docker Compose can remain responsible for infrastructure such as Kafka, databases, and shared services. Your orchestrator can use the Docker Engine API or the Compose CLI to manage service lifecycle operations.
+For dynamic application services, you have two reasonable choices:
+- Generate Compose configuration: keep a registry of services and generate a Compose project from it. This is straightforward if you want to preserve a Compose-centric workflow.
+- Manage containers directly: use the Docker API to create and replace application containers while leaving infrastructure under Compose. This offers finer control but means implementing more lifecycle and dependency logic yourself.
+I'd start with the first option unless you need containers to be created and removed very frequently.
