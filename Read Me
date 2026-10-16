@@ -42,3 +42,354 @@ For dynamic application services, you have two reasonable choices:
 - Generate Compose configuration: keep a registry of services and generate a Compose project from it. This is straightforward if you want to preserve a Compose-centric workflow.
 - Manage containers directly: use the Docker API to create and replace application containers while leaving infrastructure under Compose. This offers finer control but means implementing more lifecycle and dependency logic yourself.
 I'd start with the first option unless you need containers to be created and removed very frequently.
+
+
+
+Architecture: Dynamic Microservices Development Platform
+For your existing Python + React application, I'd build a lightweight service orchestrator inside your existing backend, rather than introduce Kubernetes or another orchestration platform.
+Your goal is to make repositories and services dynamically manageable while retaining your existing Docker Compose-based environment for Kafka, HTTP mocks, and shared infrastructure.
+The core workflow should be:
+1. Register a local repository or Git repository.
+2. Configure how its service is built and run.
+3. Build the Docker image and stream progress to React.
+4. Start, stop, restart, or rebuild that service independently.
+5. Inspect logs, health, dependencies, and pipeline connectivity.
+6. Persist the configuration so services remain registered after the web app restarts.
+1. Proposed architecture
+React frontend
+Service catalog · Pipeline graph · Build console · Log viewer
+
+FastAPI backend
+REST API · SSE event stream · Validation · Job orchestration
+
+Job manager
+Build, start, stop, restart
+
+
+SQLite
+Service registry and job history
+
+
+
+Docker Engine API
+Image builds · Containers · Networks · Logs · Health
+
+Shared infrastructure
+Kafka · Databases · Mock HTTP services
+
+Managed application services
+S1 · S2 · S3 · S4 · S5
+
+
+
+Technology choices
+Component	Recommendation
+Backend API	FastAPI, if that matches your existing Python stack
+Docker integration	Docker SDK for Python (docker)
+Persistent registry	SQLite with SQLAlchemy or SQLModel
+Background jobs	A small asyncio-based job manager for the first version
+Live progress	Server-Sent Events (SSE)
+Frontend	Existing React app, using fetch and EventSource
+Configuration	Validated service manifest in YAML or JSON
+Infrastructure	Existing Docker Compose project
+If your current backend uses Flask or Django, keep it; the same architecture applies. You don't need to rewrite the backend just to use FastAPI.
+Why SSE first? Builds and container operations mainly need server-to-browser updates. SSE is simpler than a bidirectional WebSocket connection for streaming build output, state changes, and job progress. Use ordinary REST calls for actions.
+2. Design the service registry first
+Don't use the generated Compose file as your database. Store the desired configuration independently, then let your backend translate that configuration into Docker operations.
+A service manifest could look like this:
+id: order-processor
+name: Order Processor
+
+source:
+  type: local
+  path: ../services/order-processor
+  branch: null
+
+build:
+  context: .
+  dockerfile: Dockerfile
+  target: null
+
+runtime:
+  container_name: dev-order-processor
+  image: local/order-processor
+  ports:
+    - "18082:8080"
+  environment:
+    APP_ENV: development
+  network: local-dev
+
+healthcheck:
+  type: http
+  url: http://dev-order-processor:8080/health
+
+dependencies:
+  - kafka
+
+messaging:
+  consumes:
+    - orders.incoming
+  produces:
+    - orders.processed
+
+
+Treat this as a proposed schema, not a configuration format your existing application already supports.
+For Git repositories, also store the repository URL, branch, checkout directory, and selected commit. For local repositories, store a canonical absolute path.
+Database models
+I'd start with three main tables.
+Table	Important fields
+services	id, name, source_config, build_config, runtime_config, created_at
+jobs	id, service_id, action, status, started_at, finished_at, error
+job_events	job_id, sequence, timestamp, event_type, message
+The services table describes what should exist. The Docker Engine describes what is actually running. Your UI should display both, because they can disagree.
+For example, a service may be registered but not built, built but stopped, or running with an unhealthy status.
+3. Define a clean REST API
+Keep the API centred on services and asynchronous jobs.
+Endpoint	Purpose
+POST /api/services	Register a service
+GET /api/services	List services and runtime states
+GET /api/services/{id}	Get configuration and current state
+PATCH /api/services/{id}	Update configuration
+DELETE /api/services/{id}	Unregister a service
+POST /api/services/{id}/build	Build its image
+POST /api/services/{id}/start	Create or start its container
+POST /api/services/{id}/stop	Gracefully stop its container
+POST /api/services/{id}/restart	Restart its container
+POST /api/services/{id}/rebuild	Build a new image and replace its container
+GET /api/jobs/{job_id}	Inspect operation status
+GET /api/jobs/{job_id}/events	Stream job progress using SSE
+GET /api/services/{id}/logs	Stream runtime logs
+Long-running actions should return 202 Accepted with a job ID rather than keeping the HTTP request open until the build finishes.
+For example:
+{
+  "job_id": "job-123",
+  "service_id": "order-processor",
+  "action": "build",
+  "status": "queued",
+  "events_url": "/api/jobs/job-123/events"
+}
+
+
+This lets the frontend continue navigating while the build runs.
+4. Implement the Docker lifecycle as separate operations
+Use a Python service layer rather than calling Docker directly from route handlers.
+Suggested modules:
+backend/
+  api/
+    services.py
+    jobs.py
+  domain/
+    service_manifest.py
+    service_state.py
+  orchestrator/
+    registry.py
+    job_manager.py
+    build_manager.py
+    container_manager.py
+    dependency_graph.py
+    event_bus.py
+  persistence/
+    models.py
+    repositories.py
+  main.py
+
+
+Build operation
+Using the Docker SDK for Python, the essential operation is:
+import dockerclient = docker.from_env()image, build_logs = client.images.build(    path=build_context,    dockerfile=dockerfile,    tag=image_tag,    rm=True,)for event in build_logs:    # Convert Docker build events into structured job events.    # Persist them and publish them to the frontend.    pass
+
+
+
+In production code, validate build_context, resolve the Dockerfile safely, handle Docker API exceptions, and process build events incrementally. The SDK build stream may contain both progress and error information, so don't treat every event as a simple text line.
+Start operation
+1. Verify the image exists.
+2. Verify required infrastructure and dependencies are ready.
+3. Create the container with the configured network, environment, ports, and volumes.
+4. Start it.
+5. Wait for the configured readiness check.
+6. Mark the operation successful only when the service meets its readiness criteria.
+Stop operation
+1. Request a graceful stop.
+2. Wait for the configured timeout.
+3. Report the final container state.
+4. Preserve logs and job history.
+Don't delete the container automatically when stopping it. Keeping it around makes inspection and debugging easier.
+Rebuild operation
+I'd implement rebuild as an explicit workflow rather than simply running docker compose up --build.
+1. Build the new image under a unique or versioned tag.
+2. If the build fails, keep the existing container running.
+3. Validate configuration and dependencies.
+4. Replace the container with one using the new image.
+5. Wait for readiness.
+6. Record the resulting image ID and build metadata.
+This is safer than deleting the running container before you know the replacement can be built.
+One limitation to understand: when the application listens on a fixed host port, Docker generally can't run both old and new containers with that same port simultaneously. A true zero-downtime swap needs a proxy or a different port strategy. For a local development utility, a short interruption is usually acceptable.
+5. Stream build output to React
+I recommend SSE for both build progress and job status. Keep runtime container logs as a separate stream, even if both use the same underlying event infrastructure.
+An event could look like:
+event: build_log
+data: {"job_id":"job-123","line":"Step 3/8: COPY . /app"}
+
+event: progress
+data: {"job_id":"job-123","stage":"building","percent":45}
+
+event: completed
+data: {"job_id":"job-123","status":"succeeded"}
+
+
+These event types are illustrative. Docker's own build progress isn't always a reliable percentage, so use stage-based progress unless you have a defensible way to calculate the percentage.
+React hook
+import { useEffect, useState } from "react";
+
+export function useJobEvents(jobId) {
+  const [events, setEvents] = useState([]);
+  const [status, setStatus] = useState("queued");
+
+  useEffect(() => {
+    if (!jobId) return;
+
+    const stream = new EventSource(
+      `/api/jobs/${jobId}/events`
+    );
+
+    const append = (event) => {
+      const payload = JSON.parse(event.data);
+
+      setEvents((previous) => [...previous, payload]);
+
+      if (payload.status) {
+        setStatus(payload.status);
+      }
+    };
+
+    for (const eventType of [
+      "build_log",
+      "progress",
+      "state_changed",
+      "completed",
+      "failed",
+    ]) {
+      stream.addEventListener(eventType, append);
+    }
+
+    stream.onerror = () => {
+      // EventSource reconnects automatically.
+      // The backend must support event replay or resumption.
+    };
+
+    return () => stream.close();
+  }, [jobId]);
+
+  return { events, status };
+}
+
+
+For a real implementation, include a monotonically increasing event ID, support SSE Last-Event-ID or a replay cursor, and fetch the latest job status after reconnecting. Otherwise, a browser refresh can leave the UI with incomplete history.
+Use the same general pattern for runtime logs, with a separate endpoint such as /api/services/{id}/logs.
+6. Design the React experience around jobs
+I would create four screens or panels.
+
+
+
+
+
+
+
+
+
+Service catalog
+Search, add repositories, view health, identify unbuilt services, and trigger actions on individual services.
+
+
+
+
+
+
+
+
+
+
+
+Build and job console
+Show queued/running/succeeded/failed jobs, streaming output, error details, duration, and a retry action.
+
+
+
+
+
+
+
+
+
+
+
+Pipeline graph
+Show service-to-Kafka-to-service and HTTP connections. Clicking a service opens its configuration, logs, and lifecycle controls.
+
+
+
+
+
+
+
+
+
+
+
+Service detail drawer
+Show repository information, selected commit, image ID, container state, health checks, environment configuration, and recent jobs.
+
+
+
+7. Handle concurrency and failure properly
+This is the part that will determine whether the utility remains reliable when multiple operations run simultaneously.
+- One mutating job per service: prevent two builds or a build and stop from racing on the same service.
+- Parallel jobs across services: allow S2 and S4 to build concurrently when resources permit.
+- Idempotent operations: repeated start or stop requests should not create unexpected duplicate containers.
+- Dependency-aware actions: starting S3 should verify its prerequisites; stopping Kafka should warn about dependent services.
+- Persistent jobs: save job state and events so the frontend can reconnect after a backend restart.
+- Resource limits: cap concurrent builds and set sensible log-retention limits.
+- Failure visibility: distinguish a build failure, container startup failure, failed health check, and dependency timeout.
+For an initial local-only tool, an asyncio job manager and SQLite are adequate. If you later need multiple backend workers, distributed locking, or durable scheduling, you can move to a proper job queue.
+8. Security boundaries
+Because the backend can control Docker, treat it as a privileged component.
+- Bind the UI and API to localhost by default.
+- Don't expose the Docker socket to the React frontend.
+- Allowlist repository roots for local paths and validate Git URLs.
+- Avoid arbitrary shell command construction from UI inputs.
+- Keep secrets out of build logs and persisted job events.
+- Use explicit configuration schemas rather than accepting arbitrary container settings without validation.
+If your utility is accessible to other machines, add authentication and stronger authorization before enabling container management.
+9. Implementation roadmap
+I'd implement this in six small milestones, each leaving your current utility usable.
+Development checklist
+0 of 6
+
+[ ] Milestone 1 — Registry
+Persist service manifests; add, edit and remove services.
+
+
+[ ] Milestone 2 — Docker adapter
+Build, start, stop, restart, inspect and fetch logs for one service.
+
+
+[ ] Milestone 3 — Jobs and SSE
+Background jobs, persistent event history and live React output.
+
+
+[ ] Milestone 4 — Safe rebuild
+Versioned images, replacement workflow and health verification.
+
+
+[ ] Milestone 5 — Dependencies
+Graph service dependencies and implement readiness checks.
+
+
+[ ] Milestone 6 — Debugging
+Trace messages, replay test inputs and inject HTTP/Kafka faults.
+
+
+
+My final recommendation
+Start by implementing the registry, Docker adapter, and job/event model before building the polished UI. Once those contracts are stable, the React screens become relatively straightforward, and you can add pipeline visualization and debugging features without rewriting the lifecycle layer.
+I would also keep the shared Kafka infrastructure under your existing Compose configuration and manage application services independently where possible. This allows you to rebuild S3 without accidentally recreating Kafka or disturbing every other running service.
