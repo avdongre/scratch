@@ -1,0 +1,23 @@
+NASL Mock Output Studio
+A local web application for QA and test-data generation
+
+1. Load NASL files
+Upload one file or a directory of plugins. Extract plugin IDs, names, metadata, output-related code and relevant branches.
+
+
+
+2. Select a test scenario
+Choose scenarios such as vulnerable, patched, service unavailable, authentication failed, or timeout — where those scenarios make sense for the plugin.
+
+
+
+3. Generate mock output
+Use the NASL source as context to create output that resembles the plugin's actual output format, with configurable hostnames, ports, version strings and other test values.
+
+
+
+4. Export test fixtures
+Copy the output as text or export structured test fixtures for your parser, dashboard, reporting pipeline or test harness. Optionally create synthetic .nessus XML fixtures.
+
+
+https://github.com/LimberDuck/nessus-file-analyzer
